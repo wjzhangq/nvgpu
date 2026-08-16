@@ -1,0 +1,83 @@
+# gpumon 配置示例
+#
+# 严格模式解析：字段名写错会直接报错退出，不会被静默忽略。
+
+server:
+  # 监听地址。接口无鉴权，请只绑内网地址或放在反向代理后面。
+  listen: "0.0.0.0:8080"
+  # 是否返回 CORS 头，默认 true。
+  cors: true
+
+defaults:
+  # 全局默认采集间隔，可被单个节点覆盖。
+  interval: 5s
+  # 每个节点保留的历史点数，硬上限 60。
+  history_size: 60
+  # 单次采集超时。实际生效值 = min(collect_timeout, 该节点的 interval)。
+  collect_timeout: 10s
+
+nodes:
+  # ---------------------------------------------------------------------
+  # 本机（运行 nvgpu 进程的这台）。Linux / Windows 都支持。
+  # 全局最多配置一个 type: local。
+  # ---------------------------------------------------------------------
+  - name: local-workstation
+    type: local
+    interval: 2s
+    # 磁盘采集模式（可选，默认 "mount"）：
+    #   - "mount": 按挂载点采集文件系统容量（历史行为，向后兼容）
+    #   - "block": 按物理块设备采集磁盘原始容量，不关心挂载目录
+    disk_mode: block
+    # disks 白名单（可选）：
+    #   - mount 模式：挂载点列表，如 ["/", "/data"]（Windows: ["C:\\", "D:\\"]）
+    #   - block 模式：设备名列表，如 ["nvme0n1", "sda"]，支持 /dev/ 前缀
+    #                 Windows: ["0", "1"] 或 ["\\\\.\\PHYSICALDRIVE0"]
+    #   - 留空：自动发现
+    #       * mount 模式：排除伪文件系统（tmpfs/overlay/proc 等），忽略 <1GB 小分区
+    #       * block 模式：排除虚拟设备（loop/dm/zram 等），忽略 <10GB 小盘
+    disks: []
+    # nvidia-smi 路径，留空自动探测（Windows 会额外扫 DriverStore）。
+    nvidia_smi: ""
+
+  # ---------------------------------------------------------------------
+  # 远程 Linux 机器：无 agent，纯 SSH 执行命令后解析输出。
+  # SSH 认证仅支持密钥（key_file / use_agent），不支持密码登录。
+  # ---------------------------------------------------------------------
+  - name: gpu-server-01
+    type: ssh
+    interval: 5s
+    disk_mode: block
+    disks: ["nvme0n1", "sda"]
+    ssh:
+      host: 192.168.1.11
+      port: 22
+      user: nvidia
+      # 私钥路径（支持 ~ 展开）
+      key_file: ~/.ssh/id_ed25519
+      # 私钥带口令时填这里
+      # passphrase: ""
+      # 校验对端主机指纹。首次连接前先手动 ssh 一次把指纹写进 known_hosts。
+      known_hosts_file: ~/.ssh/known_hosts
+      connect_timeout: 8s
+
+  # 用 ssh-agent 认证（需要环境里有 SSH_AUTH_SOCK）
+  - name: gpu-server-02
+    type: ssh
+    interval: 10s
+    disk_mode: block
+    ssh:
+      host: 192.168.1.12
+      user: ubuntu
+      use_agent: true
+      known_hosts_file: ~/.ssh/known_hosts
+
+  # 挂载点模式示例（向后兼容，默认行为）
+  - name: file-server
+    type: ssh
+    # disk_mode: mount  # 可省略，默认就是 mount
+    disks: ["/", "/data", "/mnt/storage"]
+    ssh:
+      host: 192.168.1.20
+      user: admin
+      key_file: ~/.ssh/id_rsa
+      known_hosts_file: ~/.ssh/known_hosts

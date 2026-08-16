@@ -1,0 +1,7 @@
+/gpumon
+/gpumon.exe
+/gpumon-*
+/nvgpu
+/nvgpu.exe
+/dist/
+/config.yaml

@@ -11,7 +11,7 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,27 +36,72 @@ jobs:
       - name: Test (no_nvml)
         run: go test -tags no_nvml ./...
 
-      - name: Build matrix
+  build-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      - name: Build multi-platform binaries
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME}"
           LDFLAGS="-s -w -X main.version=${VERSION}"
           mkdir -p dist
+
           # 交叉编译产物走 no_nvml（纯 Go，无 CGO），GPU 采集使用 nvidia-smi
           # GB10 / Grace 是 arm64，必须带上
           CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -tags no_nvml -ldflags "$LDFLAGS" -o dist/nvgpu-linux-amd64
           CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -tags no_nvml -ldflags "$LDFLAGS" -o dist/nvgpu-linux-arm64
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags no_nvml -ldflags "$LDFLAGS" -o dist/nvgpu-windows-amd64.exe
+
           # 本机 NVML 构建（需要 CGO），GPU 采集快 4-5 倍
           CGO_ENABLED=1 GOOS=linux   GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/nvgpu-linux-amd64-nvml
 
+      - name: Package archives
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          mkdir -p pkg
+
+          pack() {
+            local name="$1" bin="$2" ext="$3"
+            local stage="pkg/stage/${name}"
+            mkdir -p "$stage"
+            cp "dist/${bin}" "$stage/nvgpu${ext}"
+            cp README.md config.example.yaml "$stage/"
+            if [ "$ext" = ".exe" ]; then
+              (cd pkg/stage && zip -qr "../${name}.zip" "${name}")
+            else
+              tar -czf "pkg/${name}.tar.gz" -C pkg/stage "${name}"
+            fi
+            rm -rf "$stage"
+          }
+
+          pack "nvgpu-${VERSION}-linux-amd64"      nvgpu-linux-amd64        ""
+          pack "nvgpu-${VERSION}-linux-arm64"      nvgpu-linux-arm64        ""
+          pack "nvgpu-${VERSION}-linux-amd64-nvml" nvgpu-linux-amd64-nvml   ""
+          pack "nvgpu-${VERSION}-windows-amd64"    nvgpu-windows-amd64.exe  ".exe"
+
+          rmdir pkg/stage
+          (cd pkg && sha256sum * > SHA256SUMS.txt)
+          ls -lh pkg
+
       - uses: actions/upload-artifact@v4
         with:
-          name: nvgpu-binaries
-          path: dist/*
+          name: nvgpu-packages
+          path: pkg/*
 
-      - name: Release
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: pkg/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true

@@ -53,6 +53,12 @@ type GPU struct {
 	VRAMUsedBytes      uint64  `json:"vram_used_bytes"`
 	VRAMUsagePercent   float64 `json:"vram_usage_percent"`
 
+	// 温度（摄氏度），0 表示未采集或不支持
+	TemperatureCelsius uint32 `json:"temperature_celsius,omitempty"`
+
+	// 功耗（瓦特），0 表示未采集或不支持
+	PowerWatts float64 `json:"power_watts,omitempty"`
+
 	// Unified 含义同 Memory.Unified。
 	Unified bool `json:"unified"`
 }

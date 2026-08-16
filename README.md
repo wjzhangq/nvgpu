@@ -28,6 +28,14 @@
 
 **本机 GPU 优先走 NVML。** nvidia-smi 每次调用都要 fork 进程并重新初始化驱动（50-200ms），是单次采集的主要开销。本机采集优先调用 NVML 库（5-15ms），失败时自动回退到 nvidia-smi。远程节点因为无 agent 设计仍走 nvidia-smi。
 
+## 新增功能
+
+**GPU 温度与功耗监控。** 采集 GPU 核心温度（℃）和当前功耗（W）。本机采集通过 NVML 获取（`Device.GetTemperature` / `Device.GetPowerUsage`），远程采集通过 nvidia-smi 的 `temperature.gpu` / `power.draw` 字段。不支持的设备填 0。
+
+**系统服务注册。** 支持将 nvgpu 注册为系统服务，开机自启。Linux 使用 systemd，Windows 使用 Service Control Manager。使用 `nvgpu service install` 命令一键安装。
+
+**内置 Web 看板。** 访问 `http://<listen>/` 可查看实时监控看板，每 5 秒自动刷新。单文件 HTML（约 6KB），编译到二进制，无需额外部署。
+
 ## 支持范围
 
 - 中心进程：Linux (amd64 / arm64) 和 Windows (amd64)
@@ -44,7 +52,7 @@
 | CPU + 内存 | 2-3ms | 读 `/proc`，已无优化空间 |
 | 磁盘（首次/缓存过期）| 5-20ms | 扫挂载点 + 查用量 |
 | 磁盘（缓存命中）| 1-2ms | 复用挂载点列表，只查用量 |
-| GPU（NVML）| 5-15ms | 直接调库 |
+| GPU（NVML）| 5-15ms | 直接调库（含温度/功耗采集） |
 | GPU（nvidia-smi）| 50-200ms | fork 进程 + 重新初始化驱动 |
 
 **有 GPU 的本机节点**：默认构建约 20ms，`-tags no_nvml` 构建约 90ms。
@@ -98,16 +106,38 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags no_nvml -ldflags "-s -w" 
 ```bash
 cp config.example.yaml config.yaml
 # 编辑 config.yaml
-./gpumon -config config.yaml
+./nvgpu -config config.yaml
 ```
 
-命令行参数：
+### 命令行参数
+
+**常规运行**：
 
 | 参数 | 说明 |
 |---|---|
 | `-config` | 配置文件路径，默认 `config.yaml` |
 | `-listen` | 覆盖配置里的 `server.listen` |
 | `-version` | 打印版本号后退出 |
+
+**服务管理**：
+
+```bash
+nvgpu -config <path> service <command>
+```
+
+| 命令 | 说明 |
+|---|---|
+| `install` | 安装系统服务（需要管理员权限） |
+| `uninstall` | 卸载系统服务 |
+| `start` | 启动服务 |
+| `stop` | 停止服务 |
+| `restart` | 重启服务 |
+| `status` | 查看服务状态 |
+
+**注意**：
+- `-config` 参数必须在 `service` 之前
+- 建议使用绝对路径（systemd 工作目录可能不同）
+- SSH 私钥路径也需要绝对路径
 
 ## 配置
 
@@ -217,6 +247,12 @@ nodes:
 
 所有接口只读，只接受 `GET`。**没有鉴权**，请只绑内网地址或放在反向代理后面。
 
+### `GET /`
+
+**Web 看板**（v1.1+ 新增）。返回单页面 HTML 监控看板，展示所有节点的实时指标，每 5 秒自动刷新。
+
+浏览器访问 `http://<listen>/` 即可查看。
+
 ### `GET /api/v1/metrics`
 
 当前指标。`?node=a,b` 过滤（可重复传参），留空返回全部。
@@ -263,6 +299,8 @@ nodes:
           "vram_total_bytes": 127928205312,
           "vram_used_bytes": 68719476736,
           "vram_usage_percent": 53.72,
+          "temperature_celsius": 72,
+          "power_watts": 235.6,
           "unified": true
         }
       ],
@@ -355,6 +393,15 @@ nodes:
 
 存活探针。
 
+## GPU 温度与功耗字段
+
+v1.1+ 新增：
+
+- `temperature_celsius`：GPU 核心温度（摄氏度），0 表示不支持或未采集
+- `power_watts`：当前功耗（瓦特），0 表示不支持或未采集
+
+本机采集通过 NVML API 获取，远程采集通过 nvidia-smi 的 `temperature.gpu` 和 `power.draw` 字段。
+
 ## 单位约定
 
 容量类字段一律 **字节**，百分比为 0–100 的浮点数（两位小数）。服务端不做 GB 换算，避免有损取整——客户端自己除。
@@ -368,31 +415,70 @@ nodes:
 
 ## 部署
 
-### systemd
+### 作为系统服务运行（推荐）
 
-```ini
-[Unit]
-Description=gpumon
-After=network-online.target
-Wants=network-online.target
+**Linux**：
+```bash
+# 1. 准备配置文件（使用绝对路径）
+sudo mkdir -p /opt/nvgpu
+sudo cp nvgpu /opt/nvgpu/
+sudo cp config.yaml /opt/nvgpu/
 
-[Service]
-Type=simple
-User=gpumon
-WorkingDirectory=/opt/gpumon
-ExecStart=/opt/gpumon/gpumon -config /opt/gpumon/config.yaml
-Restart=always
-RestartSec=5
+# 2. 安装服务
+sudo /opt/nvgpu/nvgpu -config /opt/nvgpu/config.yaml service install
 
-[Install]
-WantedBy=multi-user.target
+# 3. 启动服务
+sudo systemctl start nvgpu
+
+# 4. 查看状态
+sudo systemctl status nvgpu
+journalctl -u nvgpu -f
+
+# 5. 开机自启
+sudo systemctl enable nvgpu
 ```
 
-注意 systemd 拉起的进程环境很干净：用 `use_agent` 认证的话 `SSH_AUTH_SOCK` 不会存在，用 `~` 路径的话 `HOME` 需要能解析。生产环境建议用绝对路径 + `key_file`。
+生成的 systemd unit 位于 `/etc/systemd/system/nvgpu.service`。
 
-### Windows
+**Windows**：
+```cmd
+REM 以管理员身份运行 PowerShell
 
-直接运行 exe 即可。原 gpu2 里的 Windows 服务注册逻辑没有搬过来——如果需要，用 `sc.exe create` 或 NSSM 包一层，或者提一下我加回 `svc.Run` 那套。
+REM 1. 准备配置文件
+mkdir C:\nvgpu
+copy nvgpu.exe C:\nvgpu\
+copy config.yaml C:\nvgpu\
+
+REM 2. 安装服务
+C:\nvgpu\nvgpu.exe -config C:\nvgpu\config.yaml service install
+
+REM 3. 启动服务
+sc start nvgpu
+
+REM 4. 查看状态
+sc query nvgpu
+```
+
+**卸载**：
+```bash
+# Linux
+sudo systemctl stop nvgpu
+sudo /opt/nvgpu/nvgpu service uninstall
+
+# Windows（管理员 PowerShell）
+sc stop nvgpu
+C:\nvgpu\nvgpu.exe service uninstall
+```
+
+**注意**：systemd 拉起的进程环境很干净，用 `use_agent` 认证的话 `SSH_AUTH_SOCK` 不会存在，用 `~` 路径的话 `HOME` 需要能解析。生产环境建议用绝对路径 + `key_file`。
+
+### 手动运行（开发/测试）
+
+```bash
+./nvgpu -config config.yaml
+```
+
+按 Ctrl+C 退出。
 
 ## 后续可加的东西
 
@@ -400,7 +486,8 @@ WantedBy=multi-user.target
 
 - 跨机汇总接口（对应 gpu2 的 `/merge`）
 - Prometheus `/metrics` 导出
-- 内置 Web 看板
 - API Token 鉴权
-- GPU 温度 / 功耗、磁盘 IO、网络吞吐
+- 磁盘 IO、网络吞吐监控
+- GPU 风扇转速、频率监控
+- 多传感器温度（显存温度、PCB 温度）
 - AMD / 国产 NPU 支持（采集器接口已经抽象好，加一个实现即可）

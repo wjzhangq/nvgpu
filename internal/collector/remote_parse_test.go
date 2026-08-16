@@ -191,8 +191,8 @@ func TestBuildRemoteTopologyAarch64FallsBackToLscpu(t *testing.T) {
 }
 
 func TestParseNvidiaCSV(t *testing.T) {
-	out := "0, NVIDIA RTX PRO 5000 Blackwell, GPU-abc, 37, 49140, 12288\n" +
-		"1, NVIDIA RTX PRO 5000 Blackwell, GPU-def, 0, 49140, 0\n"
+	out := "0, NVIDIA RTX PRO 5000 Blackwell, GPU-abc, 37, 49140, 12288, 58, 210.00\n" +
+		"1, NVIDIA RTX PRO 5000 Blackwell, GPU-def, 0, 49140, 0, 32, 15.50\n"
 	gpus := parseNvidiaCSV(out)
 
 	if len(gpus) != 2 {
@@ -206,6 +206,42 @@ func TestParseNvidiaCSV(t *testing.T) {
 	}
 	if gpus[1].UtilizationPercent != 0 {
 		t.Fatalf("利用率错误: %v", gpus[1].UtilizationPercent)
+	}
+}
+
+func TestParseNvidiaCSV_WithTempAndPower(t *testing.T) {
+	// 正常情况：8 字段完整
+	out := "0, RTX 4090, GPU-abc, 85, 24576, 8192, 67, 320.50\n" +
+		"1, RTX 4090, GPU-def, 42, 24576, 1024, 45, 125.30"
+	gpus := parseNvidiaCSV(out)
+	if len(gpus) != 2 {
+		t.Fatalf("expected 2 GPUs, got %d", len(gpus))
+	}
+	if gpus[0].TemperatureCelsius != 67 {
+		t.Errorf("GPU 0 temp: expected 67, got %d", gpus[0].TemperatureCelsius)
+	}
+	if gpus[0].PowerWatts != 320.50 {
+		t.Errorf("GPU 0 power: expected 320.50, got %.2f", gpus[0].PowerWatts)
+	}
+
+	// 容错：字段不可用（[N/A]）
+	out = "0, RTX 3060, GPU-xyz, 50, 12288, 6144, [N/A], [N/A]"
+	gpus = parseNvidiaCSV(out)
+	if len(gpus) != 1 {
+		t.Fatalf("expected 1 GPU, got %d", len(gpus))
+	}
+	if gpus[0].TemperatureCelsius != 0 {
+		t.Errorf("expected temp=0 for [N/A], got %d", gpus[0].TemperatureCelsius)
+	}
+	if gpus[0].PowerWatts != 0 {
+		t.Errorf("expected power=0 for [N/A], got %.2f", gpus[0].PowerWatts)
+	}
+
+	// 容错：老版本只有 6 字段（应跳过）
+	out = "0, GTX 1080, GPU-old, 30, 8192, 2048"
+	gpus = parseNvidiaCSV(out)
+	if len(gpus) != 0 {
+		t.Errorf("expected 0 GPUs for 6-field CSV, got %d", len(gpus))
 	}
 }
 

@@ -21,7 +21,7 @@ type Collector interface {
 }
 
 // nvidiaQuery 是本机与远程共用的 nvidia-smi 查询字段。
-const nvidiaQuery = "index,name,uuid,utilization.gpu,memory.total,memory.used"
+const nvidiaQuery = "index,name,uuid,utilization.gpu,memory.total,memory.used,temperature.gpu,power.draw"
 
 // nvidiaArgs 返回完整的 nvidia-smi 参数列表。
 func nvidiaArgs() []string {
@@ -31,7 +31,8 @@ func nvidiaArgs() []string {
 const mib = uint64(1024 * 1024)
 
 // parseNvidiaCSV 解析 nvidia-smi 的 CSV 输出。
-// 字段顺序必须与 nvidiaQuery 一致：index,name,uuid,util,mem.total,mem.used（单位 MiB）。
+// 字段顺序必须与 nvidiaQuery 一致：index,name,uuid,util,mem.total,mem.used,temp,power。
+// memory 单位 MiB，temperature 单位 ℃，power 单位 W。
 // 无法解析的行（例如驱动报错文本、"[N/A]"）会被跳过。
 func parseNvidiaCSV(out string) []model.GPU {
 	var gpus []model.GPU
@@ -41,7 +42,7 @@ func parseNvidiaCSV(out string) []model.GPU {
 			continue
 		}
 		f := strings.Split(line, ",")
-		if len(f) < 6 {
+		if len(f) < 8 {
 			continue
 		}
 		for i := range f {
@@ -54,6 +55,8 @@ func parseNvidiaCSV(out string) []model.GPU {
 		}
 		total := parseUint(f[4]) * mib
 		used := parseUint(f[5]) * mib
+		temp := uint32(parseUint(f[6]))   // temperature.gpu (℃)
+		power := round2(parseFloat(f[7])) // power.draw (W)
 
 		gpus = append(gpus, model.GPU{
 			Index:              idx,
@@ -63,6 +66,8 @@ func parseNvidiaCSV(out string) []model.GPU {
 			VRAMTotalBytes:     total,
 			VRAMUsedBytes:      used,
 			VRAMUsagePercent:   round2(model.Percent(used, total)),
+			TemperatureCelsius: temp,
+			PowerWatts:         power,
 		})
 	}
 	return gpus

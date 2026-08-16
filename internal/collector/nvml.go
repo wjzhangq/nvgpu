@@ -53,6 +53,20 @@ func (l *Local) collectGPUsNVML(ctx context.Context) []model.GPU {
 			memUsed = mem.Used
 		}
 
+		// 温度（℃）。部分虚拟化/容器环境不支持，失败时留 0。
+		temp, ret := device.GetTemperature(nvml.TEMPERATURE_GPU)
+		var tempValue uint32
+		if ret == nvml.SUCCESS {
+			tempValue = temp
+		}
+
+		// 功耗。NVML 返回毫瓦，转换为瓦特。
+		power, ret := device.GetPowerUsage()
+		var powerValue float64
+		if ret == nvml.SUCCESS {
+			powerValue = round2(float64(power) / 1000.0)
+		}
+
 		gpus = append(gpus, model.GPU{
 			Index:              i,
 			Model:              name,
@@ -61,6 +75,8 @@ func (l *Local) collectGPUsNVML(ctx context.Context) []model.GPU {
 			VRAMTotalBytes:     memTotal,
 			VRAMUsedBytes:      memUsed,
 			VRAMUsagePercent:   round2(model.Percent(memUsed, memTotal)),
+			TemperatureCelsius: tempValue,
+			PowerWatts:         powerValue,
 		})
 	}
 	return gpus

@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GPU Monitor</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+:root {
+  --bg-0: #05070C;
+  --bg-1: #0A0D12;
+  --bg-2: #0F131C;
+  --bg-3: #161D2B;
+  --bg-4: #1E2636;
+  --accent: #38BDF8;
+  --accent-warm: #6EE7B7;
+  --text: #E5E7EB;
+  --text-dim: #9CA3AF;
+  --success: #10B981;
+  --error: #EF4444;
+}
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg-2);
+  color: var(--text);
+  padding: clamp(1rem, 3vw, 1.5rem);
+  line-height: 1.5;
+}
+.header {
+  margin-bottom: 2rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 1rem;
+}
+.header h1 {
+  font-size: clamp(1.25rem, 4vw, 1.5rem);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+.refresh-time {
+  font-size: 0.875rem;
+  color: var(--text-dim);
+}
+.nodes {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(min(400px, 100%), 1fr));
+}
+.node-card {
+  background: var(--bg-3);
+  border-radius: 12px;
+  padding: 1.5rem;
+  border: 1px solid var(--bg-4);
+}
+.node-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1rem;
+  gap: 1rem;
+}
+.node-title { font-weight: 600; }
+.node-hostname {
+  font-size: 0.875rem;
+  color: var(--text-dim);
+  margin-top: 0.25rem;
+}
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--success);
+  flex-shrink: 0;
+}
+.status-dot.offline { background: var(--error); }
+.metric { margin-bottom: 1rem; }
+.metric:last-child { margin-bottom: 0; }
+.metric-label {
+  font-size: 0.875rem;
+  color: var(--text-dim);
+  margin-bottom: 0.375rem;
+}
+.metric-bar {
+  background: var(--bg-1);
+  height: 28px;
+  border-radius: 999px;
+  overflow: hidden;
+  position: relative;
+}
+.metric-fill {
+  background: linear-gradient(90deg, var(--accent), var(--accent-warm));
+  height: 100%;
+  transition: width 0.3s ease;
+}
+.metric-value {
+  position: absolute;
+  left: 14px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 0.875rem;
+  font-weight: 500;
+  z-index: 1;
+  text-shadow: 0 0 6px rgba(0,0,0,0.6);
+}
+.error-msg {
+  color: var(--error);
+  font-size: 0.875rem;
+  padding: 0.75rem;
+  background: rgba(239, 68, 68, 0.1);
+  border-radius: 8px;
+}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>GPU Monitor</h1>
+  <div class="refresh-time" id="refresh-time">加载中...</div>
+</div>
+<div class="nodes" id="nodes"></div>
+
+<script>
+let lastUpdate = null;
+
+async function fetchMetrics() {
+  try {
+    const resp = await fetch('/api/v1/metrics');
+    const data = await resp.json();
+    lastUpdate = new Date();
+    renderNodes(data.nodes);
+    updateRefreshTime();
+  } catch (err) {
+    document.getElementById('refresh-time').textContent = '连接失败';
+    console.error(err);
+  }
+}
+
+function updateRefreshTime() {
+  if (!lastUpdate) return;
+  const elapsed = Math.floor((Date.now() - lastUpdate) / 1000);
+  document.getElementById('refresh-time').textContent =
+    elapsed === 0 ? '刚刚更新' : `${elapsed} 秒前更新`;
+}
+
+function renderNodes(nodes) {
+  const container = document.getElementById('nodes');
+  container.innerHTML = nodes.map(n => {
+    if (!n.online) {
+      return `
+        <div class="node-card">
+          <div class="node-header">
+            <div>
+              <div class="node-title">${esc(n.node)}</div>
+              <div class="node-hostname">${esc(n.host?.hostname || '-')}</div>
+            </div>
+            <span class="status-dot offline"></span>
+          </div>
+          <div class="error-msg">${esc(n.error || '离线')}</div>
+        </div>
+      `;
+    }
+
+    return `
+      <div class="node-card">
+        <div class="node-header">
+          <div>
+            <div class="node-title">${esc(n.node)}</div>
+            <div class="node-hostname">${esc(n.host.hostname)} (${esc(n.host.arch)})</div>
+          </div>
+          <span class="status-dot"></span>
+        </div>
+
+        ${n.cpus.map((c, i) => `
+        <div class="metric">
+          <div class="metric-label">CPU ${i} - ${esc(c.model)}</div>
+          <div class="metric-bar">
+            <div class="metric-fill" style="width: ${c.usage_percent}%"></div>
+            <div class="metric-value">${c.usage_percent.toFixed(1)}%</div>
+          </div>
+        </div>
+        `).join('')}
+
+        <div class="metric">
+          <div class="metric-label">Memory${n.memory.unified ? ' (统一内存)' : ''}</div>
+          <div class="metric-bar">
+            <div class="metric-fill" style="width: ${n.memory.usage_percent}%"></div>
+            <div class="metric-value">${n.memory.usage_percent.toFixed(1)}% (${gb(n.memory.used_bytes)} / ${gb(n.memory.total_bytes)} GB)</div>
+          </div>
+        </div>
+
+        ${n.gpus.map((g, i) => {
+          const extras = [];
+          if (g.temperature_celsius > 0) extras.push(`${g.temperature_celsius}°C`);
+          if (g.power_watts > 0) extras.push(`${g.power_watts.toFixed(1)}W`);
+          const suffix = extras.length > 0 ? ' | ' + extras.join(' | ') : '';
+
+          return `
+          <div class="metric">
+            <div class="metric-label">GPU ${i} - ${esc(g.model)}${g.unified ? ' (统一内存)' : ''}</div>
+            <div class="metric-bar">
+              <div class="metric-fill" style="width: ${g.utilization_percent}%"></div>
+              <div class="metric-value">${g.utilization_percent.toFixed(1)}% | VRAM: ${gb(g.vram_used_bytes)}/${gb(g.vram_total_bytes)} GB${suffix}</div>
+            </div>
+          </div>
+          `;
+        }).join('')}
+      </div>
+    `;
+  }).join('');
+}
+
+function gb(bytes) {
+  return (bytes / 1024 / 1024 / 1024).toFixed(1);
+}
+
+function esc(s) {
+  const div = document.createElement('div');
+  div.textContent = s;
+  return div.innerHTML;
+}
+
+fetchMetrics();
+setInterval(fetchMetrics, 5000);
+setInterval(updateRefreshTime, 1000);
+</script>
+</body>
+</html>

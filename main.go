@@ -26,13 +26,19 @@ import (
 )
 
 // version 由构建时通过 -ldflags "-X main.version=..." 注入。
-var version = "dev"
+var version = "1.1.0-dev"
 
 func main() {
 	cfgPath := flag.String("config", "config.yaml", "配置文件路径")
 	listen := flag.String("listen", "", "覆盖配置文件里的 server.listen")
 	showVersion := flag.Bool("version", false, "打印版本号后退出")
 	flag.Parse()
+
+	// 检测服务子命令
+	if len(flag.Args()) > 0 && flag.Args()[0] == "service" {
+		runServiceCommand(flag.Args()[1:], *cfgPath, *listen)
+		return
+	}
 
 	if *showVersion {
 		fmt.Println("gpumon", version)

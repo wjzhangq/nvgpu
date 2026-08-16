@@ -2,6 +2,7 @@
 package api
 
 import (
+	_ "embed"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -12,6 +13,9 @@ import (
 	"github.com/wjzhangq/gpumon/internal/model"
 	"github.com/wjzhangq/gpumon/internal/store"
 )
+
+//go:embed dashboard.html
+var dashboardHTML string
 
 // NodeMeta 是节点的配置侧信息（不含指标）。
 type NodeMeta struct {
@@ -74,7 +78,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/v1/nodes", s.handleNodes)
 	mux.HandleFunc("/api/v1/metrics", s.handleMetrics)
 	mux.HandleFunc("/api/v1/history", s.handleHistory)
-	mux.HandleFunc("/", s.handleIndex)
+	mux.HandleFunc("/", s.handleDashboard)
 	return s.withMiddleware(mux)
 }
 
@@ -111,21 +115,17 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+// handleDashboard 返回内嵌的单文件 Web 看板。
+// 非 "/" 路径落到这里说明是未知路由，返回 JSON 404。
+func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"service":      "gpumon",
-		"history_size": s.store.Size(),
-		"endpoints": []string{
-			"GET /healthz",
-			"GET /api/v1/nodes",
-			"GET /api/v1/metrics[?node=a,b]",
-			"GET /api/v1/history[?node=a,b][&limit=N]",
-		},
-	})
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(dashboardHTML))
 }
 
 func (s *Server) handleNodes(w http.ResponseWriter, _ *http.Request) {

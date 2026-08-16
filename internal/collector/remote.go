@@ -69,9 +69,9 @@ func NewRemote(n config.Node) (*Remote, error) {
 	}
 
 	return &Remote{
-		name:       n.Name,
-		addr:       s.Addr(),
-		user:       s.User,
+		name: n.Name,
+		addr: s.Addr(),
+		user: s.User,
 		clientCfg: &ssh.ClientConfig{
 			User:            s.User,
 			Auth:            auths,

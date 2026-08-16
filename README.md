@@ -26,23 +26,71 @@
 
 **离线也写记录。** 采集失败照样往环形缓冲里写一条 `online: false` 的记录，历史序列不会出现时间空洞，前端能画出明确的断点。
 
+**本机 GPU 优先走 NVML。** nvidia-smi 每次调用都要 fork 进程并重新初始化驱动（50-200ms），是单次采集的主要开销。本机采集优先调用 NVML 库（5-15ms），失败时自动回退到 nvidia-smi。远程节点因为无 agent 设计仍走 nvidia-smi。
+
 ## 支持范围
 
 - 中心进程：Linux (amd64 / arm64) 和 Windows (amd64)
 - 远程节点：**仅 Linux**（需要 `/proc`、`df`；`lscpu` 可选。`disk_mode: block` 需要 `/sys/block`，`lsblk` 可选）
-- 加速卡：**仅 NVIDIA**，通过 `nvidia-smi`
+- 加速卡：**仅 NVIDIA**，本机采集优先使用 NVML 库（快 4-5 倍），远程采集使用 `nvidia-smi`
 - 最多一个 `type: local` 节点，远程节点数量不限
+
+## 采集性能
+
+单次采集的耗时分布（`collect_ms` 字段可以直接观察）：
+
+| 指标 | 耗时 | 说明 |
+|---|---|---|
+| CPU + 内存 | 2-3ms | 读 `/proc`，已无优化空间 |
+| 磁盘（首次/缓存过期）| 5-20ms | 扫挂载点 + 查用量 |
+| 磁盘（缓存命中）| 1-2ms | 复用挂载点列表，只查用量 |
+| GPU（NVML）| 5-15ms | 直接调库 |
+| GPU（nvidia-smi）| 50-200ms | fork 进程 + 重新初始化驱动 |
+
+**有 GPU 的本机节点**：默认构建约 20ms，`-tags no_nvml` 构建约 90ms。
+**无 GPU 的节点**：约 4-10ms，取决于挂载点缓存是否命中。
+**远程节点**：延迟基本等于 GPU 采集耗时加一个 RTT，远程始终走 nvidia-smi。
+
+两处优化点：
+
+**GPU 走 NVML。** nvidia-smi 的开销几乎全在进程启动和驱动初始化上，查询本身很快。NVML 是 nvidia-smi 内部调用的同一个库，初始化一次后复用，省掉这两笔开销。本机采集优先走 NVML，初始化失败自动回退，不需要配置。
+
+**挂载点列表带缓存。** `disk.Partitions()` 每次都要扫 `/proc/mounts`（Windows 是注册表），但挂载点变化是分钟级以上的事。默认缓存 60s，只有用量查询每周期都做。用 `partition_cache_ttl` 调整，设成 `0s` 关掉。代价是新挂载的盘最多晚 60s 出现。
+
+| 方式 | 本机延迟 | 适用场景 |
+|------|---------|---------|
+| NVML 库（默认）| 5-15ms | 本机采集，需要 CGO 和 NVIDIA 驱动 |
+| nvidia-smi | 50-200ms | 远程 SSH 采集，或 `-tags no_nvml` 构建 |
 
 ## 构建
 
+### 默认构建（启用 NVML，推荐）
+
+默认启用 NVML 库支持，GPU 采集速度提升 **4-5 倍**（5-15ms vs 50-200ms）。需要 CGO 和 gcc/g++。
+
 ```bash
 go mod tidy
-go build -o gpumon .
+go build -o nvgpu .
+```
+
+**运行时依赖**：
+- Linux: `libnvidia-ml.so.1`（随 NVIDIA 驱动安装，通常在 `/usr/lib64` 或 `/usr/lib/x86_64-linux-gnu`）
+- Windows: `nvml.dll`（随驱动安装在 `C:\Program Files\NVIDIA Corporation\NVSMI\`）
+- macOS: 不支持（无 NVIDIA GPU）
+
+NVML 初始化失败时自动回退到 nvidia-smi，无需手动切换。
+
+### 纯 Go 构建（禁用 NVML）
+
+不依赖 CGO，适合交叉编译或无 gcc 环境，GPU 采集使用 nvidia-smi。
+
+```bash
+go build -tags no_nvml -o nvgpu .
 
 # 交叉编译
-CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -ldflags "-s -w" -o gpumon-linux-amd64
-CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -ldflags "-s -w" -o gpumon-linux-arm64   # GB10 / Grace
-CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags "-s -w" -o gpumon.exe
+CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -tags no_nvml -ldflags "-s -w" -o nvgpu-linux-amd64
+CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -tags no_nvml -ldflags "-s -w" -o nvgpu-linux-arm64   # GB10 / Grace
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags no_nvml -ldflags "-s -w" -o nvgpu.exe
 ```
 
 ## 运行
@@ -101,6 +149,7 @@ nodes:
 | `disk_mode` | 磁盘采集模式：`mount`（挂载点，默认）或 `block`（物理磁盘），见下文"磁盘采集模式"章节 |
 | `disks` | 白名单，留空自动发现。`mount` 模式：挂载点列表如 `["/", "/data"]`（Windows: `["C:\\"]`）；`block` 模式：设备名如 `["nvme0n1", "sda"]`，支持带 `/dev/` 前缀（Windows: `["0", "1"]`） |
 | `nvidia_smi` | `nvidia-smi` 路径，留空自动探测 |
+| `partition_cache_ttl` | 挂载点缓存 TTL（仅 `type: local` 且 `disk_mode: mount` 时有效）。挂载点变化频率极低，缓存可节省 5-20ms。留空默认 60s，显式设为 `0s` 禁用 |
 
 ### SSH 认证
 

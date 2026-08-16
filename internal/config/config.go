@@ -128,6 +128,9 @@ type Node struct {
 	Disks []string `yaml:"disks"`
 	// NvidiaSmi 指定 nvidia-smi 路径；留空时自动探测（远程默认用 PATH）。
 	NvidiaSmi string `yaml:"nvidia_smi"`
+	// PartitionCacheTTL 挂载点缓存 TTL（仅 type=local 且 disk_mode=mount 时有效）。
+	// 留空使用默认 60s，显式设为 0 禁用缓存。挂载点变化频率极低，缓存可节省 5-20ms。
+	PartitionCacheTTL *Duration `yaml:"partition_cache_ttl"`
 	// SSH 仅在 type=ssh 时有效。
 	SSH *SSH `yaml:"ssh"`
 }

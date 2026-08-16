@@ -38,6 +38,9 @@ nodes:
     disks: []
     # nvidia-smi 路径，留空自动探测（Windows 会额外扫 DriverStore）。
     nvidia_smi: ""
+    # 挂载点缓存 TTL（仅 type: local 且 disk_mode: mount 时有效）
+    # 挂载点变化频率极低，缓存可节省 5-20ms。留空默认 60s，显式设为 0s 禁用。
+    # partition_cache_ttl: 60s
 
   # ---------------------------------------------------------------------
   # 远程 Linux 机器：无 agent，纯 SSH 执行命令后解析输出。

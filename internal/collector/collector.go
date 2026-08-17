@@ -188,15 +188,28 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
+// toSet 把配置里的字符串列表变成集合。
+//
+// 磁盘白名单会同时塞入原始写法与归一化写法，两者都能命中：
+// 用户在配置里写 "C:"、"c:\"、"0"、"/dev/sda" 都算数，因为匹配侧查的是
+// 归一化键，而这里把归一化结果一起放进集合。Linux 挂载点等不受影响 ——
+// 归一化对它们是恒等变换。
 func toSet(items []string) map[string]bool {
 	if len(items) == 0 {
 		return nil
 	}
-	m := make(map[string]bool, len(items))
+	m := make(map[string]bool, len(items)*2)
 	for _, it := range items {
 		it = strings.TrimSpace(it)
-		if it != "" {
-			m[it] = true
+		if it == "" {
+			continue
+		}
+		m[it] = true
+		if k := normalizeMountKey(it); k != "" {
+			m[k] = true
+		}
+		if k := normalizeBlockKey(it); k != "" {
+			m[k] = true
 		}
 	}
 	if len(m) == 0 {

@@ -2,9 +2,7 @@ package collector
 
 import (
 	"context"
-	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -18,12 +16,22 @@ import (
 	"github.com/shirou/gopsutil/v4/mem"
 
 	"github.com/wjzhangq/gpumon/internal/config"
+	"github.com/wjzhangq/gpumon/internal/logx"
 	"github.com/wjzhangq/gpumon/internal/model"
 )
 
 // defaultPartitionCacheTTL 是挂载点缓存的默认存活时间。
 // 挂载点变化频率极低（分钟级以上），缓存可省下每周期 5-20ms 的扫描开销。
 const defaultPartitionCacheTTL = 60 * time.Second
+
+// nvsmiReprobeInterval 是 nvidia-smi 路径重探测的最小间隔。
+// 探测要遍历 DriverStore 下的多个候选目录，不能每个采集周期都跑一遍。
+const nvsmiReprobeInterval = 30 * time.Second
+
+// defaultGPUTimeout 是 GPU 单次采集的默认超时。
+// 独立于节点 interval：Windows 上 nvidia-smi 冷启动（驱动加载 + 卡从低功耗态唤醒）
+// 常见 1-4s，若沿用 min(collect_timeout, interval) 的 2s 预算会稳定超时。
+const defaultGPUTimeout = 10 * time.Second
 
 // Local 采集运行本程序这台机器的指标。Linux / Windows 通用。
 type Local struct {
@@ -35,8 +43,13 @@ type Local struct {
 	host model.HostInfo
 	topo []socketInfo
 
+	// GPU 异步采集器（单飞 + 缓存），解决 Windows 上 nvidia-smi 冷启动耗时导致的超时问题
+	gpuSampler *gpuSampler
 	// gpuWarned 是上一次打印过的 GPU 告警文本，用于日志去重。
 	gpuWarned string
+	// nvsmiProbedAt 是上次 nvidia-smi 路径探测的时刻，用于 30s 退避
+	// （路径探测要扫 DriverStore 目录，不能每 2s 跑一遍）。
+	nvsmiProbedAt time.Time
 
 	// 磁盘分区缓存（仅 mount 模式）：挂载点变化频率极低，缓存可减少 5-20ms 开销
 	partitionsCache     []disk.PartitionStat
@@ -53,6 +66,12 @@ func NewLocal(n config.Node) *Local {
 		ttl = n.PartitionCacheTTL.Duration
 	}
 
+	// GPU 超时解耦于采集轮次的 interval，让 Windows 上 nvidia-smi 冷启动有足够时间
+	gpuTimeout := defaultGPUTimeout
+	if n.GPUTimeout != nil && n.GPUTimeout.Duration > 0 {
+		gpuTimeout = n.GPUTimeout.Duration
+	}
+
 	l := &Local{
 		name:               n.Name,
 		diskFilter:         toSet(n.Disks),
@@ -63,12 +82,25 @@ func NewLocal(n config.Node) *Local {
 	if l.nvsmi == "" {
 		l.nvsmi = defaultNvidiaSmiPath()
 	}
+
+	// 启动时打印 nvidia-smi 路径探测结果（-v 下逐条打印候选扫描过程）
+	if l.nvsmi != "" {
+		logx.Infof("nvidia-smi 路径: %s", l.nvsmi)
+	} else {
+		logx.Infof("nvidia-smi 未找到，GPU 采集将跳过")
+	}
+
 	l.host = localHostInfo()
 	l.topo = localTopology(l.host.Model)
 
 	// 预热：gopsutil 的 Percent(0, ...) 是"距上次调用"的增量，
 	// 先打一次底，避免首个样本变成"自开机以来的平均值"。
 	_, _ = cpu.Percent(0, true)
+
+	// 初始化 GPU 采集器并预热（首屏就有数据）
+	l.gpuSampler = newGPUSampler(l.name, n.Interval.Duration, gpuTimeout, l.collectGPUsSync)
+	l.gpuSampler.warmup()
+
 	return l
 }
 
@@ -96,7 +128,14 @@ func (l *Local) Collect(ctx context.Context) (model.Snapshot, error) {
 	} else {
 		snap.Disks = l.collectDisks(ctx)
 	}
-	snap.GPUs = l.collectGPUs(ctx)
+
+	// GPU 采集走异步缓存路径，不阻塞本轮（sampler 内部单飞 + 超时脱离 ctx）
+	gpus, gpusSampledAt := l.gpuSampler.get()
+	snap.GPUs = gpus
+	// 当 GPU 采样时刻明显早于快照时刻时填充该字段，让 API 消费方知晓数据年龄
+	if gpus != nil && time.Since(gpusSampledAt) > 5*time.Second {
+		snap.GPUsSampledAt = &gpusSampledAt
+	}
 
 	if model.DetectUnifiedMemory(l.host.Arch, snap.Memory.TotalBytes, snap.GPUs) {
 		snap.Memory.Unified = true
@@ -107,6 +146,12 @@ func (l *Local) Collect(ctx context.Context) (model.Snapshot, error) {
 
 	snap.Timestamp = time.Now()
 	snap.CollectMS = time.Since(start).Milliseconds()
+
+	if logx.Verbose() {
+		logx.Debugf("node %q 采集完成: cpu=%dms mem=%dms disk=%dms gpu=cached total=%dms",
+			l.name, 0, 0, 0, snap.CollectMS) // 子系统耗时暂不埋点，先有总耗时
+	}
+
 	return snap, nil
 }
 
@@ -162,8 +207,8 @@ func (l *Local) collectDisks(ctx context.Context) []model.Disk {
 	if now.Sub(l.partitionsCacheTime) < l.partitionsCacheTTL && len(l.partitionsCache) > 0 {
 		parts = l.partitionsCache
 	} else {
-		// 缓存过期：重新扫描
-		parts, err = disk.PartitionsWithContext(ctx, false)
+		// 缓存过期：重新扫描（调用平台钩子：Windows 过滤 DRIVE_FIXED，Unix 走 gopsutil）
+		parts, err = listPartitions(ctx, l.diskFilter)
 		if err != nil {
 			return nil
 		}
@@ -175,20 +220,30 @@ func (l *Local) collectDisks(ctx context.Context) []model.Disk {
 	var out []model.Disk
 
 	for _, p := range parts {
-		mount := p.Mountpoint
+		// 上报值也走归一化：Windows 上 gopsutil 报 "C:"，归一化成 "C:\" 后
+		// 前端显示和用户在配置里写的形式一致，历史数据的 key 也稳定。
+		mount := normalizeMountKey(p.Mountpoint)
 		if mount == "" || seen[mount] {
 			continue
 		}
+		// 白名单匹配走归一化键：Windows 上配置写 "C:" / "c:\" / "C:/" 都能命中 "C:\"
 		whitelisted := l.diskFilter != nil && l.diskFilter[mount]
 		if l.diskFilter != nil && !whitelisted {
+			if logx.Verbose() {
+				logx.Debugf("挂载点 %s 不在白名单，跳过", mount)
+			}
 			continue
 		}
 		if !whitelisted && isPseudoFS(p.Fstype) {
 			continue
 		}
 
-		u, err := disk.UsageWithContext(ctx, mount)
+		// 平台钩子：Windows 直接调 GetDiskFreeSpaceEx，Unix 走 gopsutil
+		u, err := diskUsage(ctx, mount)
 		if err != nil || u == nil || u.Total == 0 {
+			if err != nil && logx.Verbose() {
+				logx.Debugf("挂载点 %s 用量查询失败: %v", mount, err)
+			}
 			continue
 		}
 		if !whitelisted && u.Total < minDiskBytes {
@@ -210,47 +265,59 @@ func (l *Local) collectDisks(ctx context.Context) []model.Disk {
 	return out
 }
 
-// collectGPUs 采集本机 GPU：优先 NVML，失败回退 nvidia-smi。
+// collectGPUsSync 同步采集本机 GPU：优先 NVML，失败回退 nvidia-smi。
+// 由 gpuSampler 在独立 goroutine 里调用，超时预算脱离采集轮次的 interval。
 //
 // Windows 发行包是 no_nvml 构建（交叉编译无法带 CGO），所以那边实际上
 // 100% 走 nvidia-smi 这条路，任何一环失败都会让整块 GPU 数据消失 ——
 // 因此这里的每种失败都要留下可诊断的日志，而不是静默返回 nil。
-func (l *Local) collectGPUs(ctx context.Context) []model.GPU {
+func (l *Local) collectGPUsSync(ctx context.Context) ([]model.GPU, error) {
 	// 优先尝试 NVML（快 4-5 倍：5-15ms vs 50-200ms）
 	if gpus := l.collectGPUsNVML(ctx); len(gpus) > 0 {
-		return gpus
+		return gpus, nil
 	}
 
 	// 启动时没探到路径（常见于 Windows 服务：服务进程的 PATH 不含驱动目录，
-	// 或安装时驱动还没就绪），每轮重试一次探测 —— 探测本身只是几个 Stat。
+	// 或安装时驱动还没就绪），按 30s 退避重试探测 —— 避免每轮重跑完整扫描。
 	if l.nvsmi == "" {
+		if time.Since(l.nvsmiProbedAt) < nvsmiReprobeInterval {
+			return nil, nil // 退避期内，跳过本轮探测
+		}
+		l.nvsmiProbedAt = time.Now()
 		l.nvsmi = defaultNvidiaSmiPath()
 		if l.nvsmi == "" {
 			l.warnGPUOnce("找不到 nvidia-smi，GPU 数据不可用（可在配置里显式设置 nvidia_smi 路径）")
-			return nil
+			return nil, nil
 		}
-		log.Printf("node %q: 已定位 nvidia-smi: %s", l.name, l.nvsmi)
+		logx.Infof("node %q: 已定位 nvidia-smi: %s", l.name, l.nvsmi)
 	}
 
+	start := time.Now()
 	res := runNvidiaSmi(ctx, l.nvsmi, nvidiaArgs())
+	if logx.Verbose() {
+		logx.Debugf("node %q: nvidia-smi 耗时 %dms, stdout %d bytes",
+			l.name, time.Since(start).Milliseconds(), len(res.stdout))
+	}
+
 	gpus := parseNvidiaCSV(res.stdout)
 	if len(gpus) > 0 {
 		l.gpuWarned = "" // 恢复正常，允许下次故障重新告警
-		return gpus
+		return gpus, nil
 	}
 
 	if res.err != nil {
 		// 路径可能因驱动升级而失效（DriverStore 目录名带版本号），
-		// 清空以便下一轮重新探测。
+		// 清空以便重新探测（30s 退避限制探测频率）。
 		if !isFile(l.nvsmi) {
-			log.Printf("node %q: nvidia-smi 路径已失效（%s），下轮重新探测", l.name, l.nvsmi)
+			logx.Infof("node %q: nvidia-smi 路径已失效（%s），将重新探测", l.name, l.nvsmi)
 			l.nvsmi = ""
+			l.nvsmiProbedAt = time.Time{} // 立即允许重探
 		}
 		l.warnGPUOnce("nvidia-smi 执行失败: " + res.briefError())
-		return nil
+		return nil, res.err
 	}
 	l.warnGPUOnce("nvidia-smi 未返回可解析的 GPU 数据: " + res.briefError())
-	return nil
+	return nil, nil
 }
 
 // warnGPUOnce 打印 GPU 采集告警，相同内容只打一次。
@@ -260,12 +327,19 @@ func (l *Local) warnGPUOnce(msg string) {
 		return
 	}
 	l.gpuWarned = msg
-	log.Printf("node %q: %s", l.name, msg)
+	logx.Infof("node %q: %s", l.name, msg)
 }
 
 func (l *Local) collectBlockDevices(ctx context.Context) []model.Disk {
 	if runtime.GOOS == "windows" {
-		return l.collectBlockDevicesWindows(ctx)
+		// 原生 IOCTL 枚举，取代原来的 wmic / PowerShell 子进程方案
+		out, err := collectBlockDevicesWindows(ctx, l.diskFilter)
+		if err != nil {
+			logx.Infof("node %q: Windows 物理磁盘枚举失败: %v", l.name, err)
+			return nil
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].Device < out[j].Device })
+		return out
 	}
 	return l.collectBlockDevicesLinux(ctx)
 }
@@ -329,149 +403,6 @@ func (l *Local) collectBlockDevicesLinux(ctx context.Context) []model.Disk {
 		seen[name] = true
 		out = append(out, model.Disk{
 			Device:     name,
-			TotalBytes: size,
-			Type:       "disk",
-			Model:      devModel,
-			Rotational: rotational,
-		})
-	}
-
-	sort.Slice(out, func(i, j int) bool { return out[i].Device < out[j].Device })
-	return out
-}
-
-// collectBlockDevicesWindows 使用 wmic 或 PowerShell 采集物理磁盘（Windows 本机）。
-func (l *Local) collectBlockDevicesWindows(ctx context.Context) []model.Disk {
-	// 优先使用 wmic diskdrive（快，可靠）
-	cmd := exec.CommandContext(ctx, "wmic", "diskdrive", "get", "DeviceID,Size,Model,MediaType", "/format:csv")
-	out, err := cmd.Output()
-	if err == nil {
-		return l.parseWmicDiskDrive(string(out))
-	}
-
-	// 回退 PowerShell Get-PhysicalDisk（Win8+ 可用，较慢）
-	ps := `Get-PhysicalDisk | Select-Object DeviceId,Size,Model,MediaType | ConvertTo-Csv -NoTypeInformation`
-	cmd = exec.CommandContext(ctx, "powershell", "-NoProfile", "-Command", ps)
-	out, err = cmd.Output()
-	if err != nil {
-		return nil
-	}
-	return l.parsePowerShellDisk(string(out))
-}
-
-func (l *Local) parseWmicDiskDrive(csv string) []model.Disk {
-	lines := strings.Split(csv, "\n")
-	if len(lines) < 2 {
-		return nil
-	}
-
-	var out []model.Disk
-	seen := make(map[string]bool)
-
-	for i, line := range lines {
-		if i == 0 || strings.TrimSpace(line) == "" {
-			continue
-		}
-		f := strings.Split(line, ",")
-		if len(f) < 5 {
-			continue
-		}
-
-		deviceID := strings.TrimSpace(f[1])
-		if deviceID == "" || seen[deviceID] {
-			continue
-		}
-
-		size := parseUint(f[3])
-		if size == 0 {
-			continue
-		}
-
-		whitelisted := l.diskFilter != nil && l.diskFilter[deviceID]
-		if l.diskFilter != nil && !whitelisted {
-			continue
-		}
-		if !whitelisted && size < minBlockDeviceBytes {
-			continue
-		}
-
-		devModel := strings.TrimSpace(f[2])
-		mediaType := strings.TrimSpace(f[4])
-
-		var rotational *bool
-		if strings.Contains(strings.ToLower(mediaType), "ssd") {
-			v := false
-			rotational = &v
-		} else if strings.Contains(strings.ToLower(mediaType), "hdd") {
-			v := true
-			rotational = &v
-		}
-
-		seen[deviceID] = true
-		out = append(out, model.Disk{
-			Device:     deviceID,
-			TotalBytes: size,
-			Type:       "disk",
-			Model:      devModel,
-			Rotational: rotational,
-		})
-	}
-
-	sort.Slice(out, func(i, j int) bool { return out[i].Device < out[j].Device })
-	return out
-}
-
-func (l *Local) parsePowerShellDisk(csv string) []model.Disk {
-	lines := strings.Split(csv, "\n")
-	if len(lines) < 2 {
-		return nil
-	}
-
-	var out []model.Disk
-	seen := make(map[string]bool)
-
-	for i, line := range lines {
-		if i == 0 || strings.TrimSpace(line) == "" {
-			continue
-		}
-		f := strings.Split(line, ",")
-		if len(f) < 4 {
-			continue
-		}
-
-		deviceID := strings.Trim(strings.TrimSpace(f[0]), `"`)
-		if deviceID == "" || seen[deviceID] {
-			continue
-		}
-
-		size := parseUint(strings.Trim(strings.TrimSpace(f[1]), `"`))
-		if size == 0 {
-			continue
-		}
-
-		whitelisted := l.diskFilter != nil && l.diskFilter[deviceID]
-		if l.diskFilter != nil && !whitelisted {
-			continue
-		}
-		if !whitelisted && size < minBlockDeviceBytes {
-			continue
-		}
-
-		devModel := strings.Trim(strings.TrimSpace(f[2]), `"`)
-		mediaType := strings.Trim(strings.TrimSpace(f[3]), `"`)
-
-		var rotational *bool
-		if strings.Contains(strings.ToLower(mediaType), "ssd") {
-			v := false
-			rotational = &v
-		} else if strings.Contains(strings.ToLower(mediaType), "hdd") {
-			v := true
-			rotational = &v
-		}
-
-		seen[deviceID] = true
-		out = append(out, model.Disk{
-			Device:     deviceID,
 			TotalBytes: size,
 			Type:       "disk",
 			Model:      devModel,

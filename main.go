@@ -21,6 +21,7 @@ import (
 	"github.com/wjzhangq/gpumon/internal/api"
 	"github.com/wjzhangq/gpumon/internal/collector"
 	"github.com/wjzhangq/gpumon/internal/config"
+	"github.com/wjzhangq/gpumon/internal/logx"
 	"github.com/wjzhangq/gpumon/internal/model"
 	"github.com/wjzhangq/gpumon/internal/store"
 )
@@ -32,7 +33,27 @@ func main() {
 	cfgPath := flag.String("config", "config.yaml", "配置文件路径")
 	listen := flag.String("listen", "", "覆盖配置文件里的 server.listen")
 	showVersion := flag.Bool("version", false, "打印版本号后退出")
+	verbose := flag.Bool("v", false, "打印详细日志到 stdout")
+	verboseLong := flag.Bool("verbose", false, "打印详细日志到 stdout（同 -v）")
+	install := flag.Bool("install", false, "注册为系统服务后退出（不启动）")
+	uninstall := flag.Bool("uninstall", false, "卸载系统服务后退出")
 	flag.Parse()
+
+	logx.SetVerbose(*verbose || *verboseLong)
+
+	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
+	log.SetPrefix("")
+
+	// -install / -uninstall：等价于 service install / service uninstall，
+	// 但少打一个子命令，便于文档里写成一行。
+	switch {
+	case *install:
+		runServiceCommand([]string{"install"}, *cfgPath, *listen)
+		return
+	case *uninstall:
+		runServiceCommand([]string{"uninstall"}, *cfgPath, *listen)
+		return
+	}
 
 	// 检测服务子命令
 	if len(flag.Args()) > 0 && flag.Args()[0] == "service" {
@@ -56,15 +77,23 @@ func main() {
 		return
 	}
 
-	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
-	log.SetPrefix("")
+	// 由服务管理器（Windows SCM / systemd）拉起时，交给 service 库接管，
+	// 它需要完成启动握手才能被认为启动成功。
+	if runAsServiceIfNeeded(*cfgPath, *listen) {
+		return
+	}
 
-	if err := run(*cfgPath, *listen); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := run(ctx, *cfgPath, *listen); err != nil {
 		log.Fatalf("fatal: %v", err)
 	}
 }
 
-func run(cfgPath, listenOverride string) error {
+// run 是常驻主循环。ctx 取消即触发优雅退出 —— 服务模式下由 service.Stop
+// 取消，命令行模式下由 Ctrl-C / SIGTERM 取消。
+func run(ctx context.Context, cfgPath, listenOverride string) error {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return err
@@ -85,8 +114,10 @@ func run(cfgPath, listenOverride string) error {
 		}
 	}()
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := context.WithCancel(ctx)
 	defer stop()
+
+	logx.Debugf("配置已加载: %s（%d 个节点，历史窗口 %d 点）", cfgPath, len(cfg.Nodes), st.Size())
 
 	var wg sync.WaitGroup
 	for i := range cfg.Nodes {
@@ -166,7 +197,14 @@ func runNode(ctx context.Context, c collector.Collector, interval, timeout time.
 		cctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 
+		started := time.Now()
 		snap, err := c.Collect(cctx)
+		if logx.Verbose() {
+			logx.Debugf("node %q: 一轮耗时 %dms cpu=%d mem_total=%d gpu=%d disk=%d err=%v",
+				c.Name(), time.Since(started).Milliseconds(),
+				len(snap.CPUs), snap.Memory.TotalBytes,
+				len(snap.GPUs), len(snap.Disks), err)
+		}
 		if err != nil {
 			if snap.Node == "" {
 				snap = model.Snapshot{Node: c.Name(), Timestamp: time.Now()}

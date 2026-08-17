@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/wjzhangq/gpumon/internal/config"
+	"github.com/wjzhangq/gpumon/internal/logx"
 	"github.com/wjzhangq/gpumon/internal/model"
 	"github.com/wjzhangq/gpumon/internal/store"
 )
@@ -102,6 +103,15 @@ func (s *Server) withMiddleware(next http.Handler) http.Handler {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "只支持 GET"})
 			return
 		}
+
+		if logx.Verbose() {
+			start := time.Now()
+			next.ServeHTTP(w, r)
+			logx.Debugf("%s %s %s %dms", r.RemoteAddr, r.Method, r.URL.Path,
+				time.Since(start).Milliseconds())
+			return
+		}
+
 		next.ServeHTTP(w, r)
 	})
 }

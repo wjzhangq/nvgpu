@@ -14,6 +14,7 @@ defaults:
   # 每个节点保留的历史点数，硬上限 60。
   history_size: 60
   # 单次采集超时。实际生效值 = min(collect_timeout, 该节点的 interval)。
+  # 注意这个预算是 CPU / 内存 / GPU / 磁盘四项**共享**的。
   collect_timeout: 10s
 
 nodes:
@@ -34,10 +35,23 @@ nodes:
     #                 Windows: ["0", "1"] 或 ["\\\\.\\PHYSICALDRIVE0"]
     #   - 留空：自动发现
     #       * mount 模式：排除伪文件系统（tmpfs/overlay/proc 等），忽略 <1GB 小分区
+    #         Windows 只枚举 DRIVE_FIXED（本地固定磁盘）；U 盘 / 光驱 / 网络盘
+    #         默认跳过，需要采就在这里显式列出盘符。
     #       * block 模式：排除虚拟设备（loop/dm/zram 等），忽略 <10GB 小盘
+    #         Windows 走原生 IOCTL 枚举 \\.\PHYSICALDRIVE0..63，可移动介质默认
+    #         跳过，白名单可拉回来。
+    # Windows 盘符写法不敏感："C:"、"c:\"、"C:/" 都等价。
     disks: []
     # nvidia-smi 路径，留空自动探测（Windows 会额外扫 DriverStore）。
     nvidia_smi: ""
+    # GPU 单次采集超时（可选，默认 10s）。
+    #
+    # 与 collect_timeout / interval 完全独立：GPU 采集跑在自己的 goroutine 里
+    # （单飞 + 缓存），采集轮次直接取缓存值，不会被 nvidia-smi 拖慢。
+    # Windows 上 nvidia-smi 冷启动（驱动加载 + 显卡从低功耗态唤醒）常要 1-4 秒，
+    # 如果沿用 min(collect_timeout, interval) 的共享预算，interval: 2s 时必然
+    # 报 context deadline exceeded。采集变慢时按这个值放宽。
+    # gpu_timeout: 10s
     # 挂载点缓存 TTL（仅 type: local 且 disk_mode: mount 时有效）
     # 挂载点变化频率极低，缓存可节省 5-20ms。留空默认 60s，显式设为 0s 禁用。
     # partition_cache_ttl: 60s

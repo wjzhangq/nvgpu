@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+
+	"github.com/wjzhangq/gpumon/internal/logx"
 )
 
 // nvidiaSmiCandidates 列出 Windows 上所有会被检查的 nvidia-smi 位置，
@@ -116,10 +118,33 @@ func driverStoreMatches(systemRoot string) []driverStoreCandidate {
 // defaultNvidiaSmiPath 在 Windows 上定位 nvidia-smi.exe。
 // 返回 nvidiaSmiCandidates 里第一个真实存在的路径。
 func defaultNvidiaSmiPath() string {
-	for _, c := range nvidiaSmiCandidates() {
+	cands := nvidiaSmiCandidates()
+
+	var hit string
+	for _, c := range cands {
 		if c.Miss == "" && isFile(c.Path) {
-			return c.Path
+			hit = c.Path
+			break
 		}
 	}
-	return ""
+
+	// -v 下把整轮扫描过程打出来。"看板上没有 GPU"最常见的原因就是这里全军覆没，
+	// 有了逐条记录，用户不必再单独跑一次 gpu-probe 就能看出是哪一层缺失。
+	if logx.Verbose() {
+		logx.Debugf("nvidia-smi 探测: 共 %d 个候选", len(cands))
+		for _, c := range cands {
+			switch {
+			case c.Path == hit:
+				logx.Debugf("  [命中] %-12s %s", c.Source, c.Path)
+			case c.Miss != "":
+				logx.Debugf("  [跳过] %-12s %s (%s)", c.Source, c.Path, c.Miss)
+			default:
+				logx.Debugf("  [候选] %-12s %s", c.Source, c.Path)
+			}
+		}
+		if hit == "" {
+			logx.Debugf("nvidia-smi 探测: 全部落空，本机将不上报 GPU")
+		}
+	}
+	return hit
 }

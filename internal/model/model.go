@@ -99,6 +99,11 @@ type Snapshot struct {
 	Memory Memory   `json:"memory"`
 	GPUs   []GPU    `json:"gpus"`
 	Disks  []Disk   `json:"disks"`
+
+	// GPUsSampledAt 是 GPU 数据的实际采样时刻，仅当它明显早于 Timestamp 时才有值。
+	// GPU 采集是异步的（单飞 + 缓存），Windows 上 nvidia-smi 冷启动可能慢于采集周期，
+	// 此时快照里的 GPU 数据来自上一次成功采样 —— 该字段让消费方知晓数据年龄。
+	GPUsSampledAt *time.Time `json:"gpus_sampled_at,omitempty"`
 }
 
 // Percent 计算 used/total 的百分比，total 为 0 时返回 0。

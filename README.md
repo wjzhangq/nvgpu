@@ -117,7 +117,29 @@ cp config.example.yaml config.yaml
 |---|---|
 | `-config` | 配置文件路径，默认 `config.yaml` |
 | `-listen` | 覆盖配置里的 `server.listen` |
+| `-v` / `-verbose` | 打印详细日志（nvidia-smi 候选扫描、每轮各子系统耗时、磁盘判定、HTTP 请求） |
 | `-version` | 打印版本号后退出 |
+
+**服务安装快捷方式**（等价于 `service install` 子命令）：
+
+| 参数 | 说明 |
+|---|---|
+| `-install` | 安装系统服务后退出（需要管理员权限），**不自动启动** |
+| `-uninstall` | 卸载系统服务后退出 |
+
+示例：
+```bash
+# 安装服务（相对路径会被转换成绝对路径，工作目录设为 exe 所在目录）
+nvgpu -v -config config.yaml -install
+
+# Linux: 启动服务
+sudo systemctl start nvgpu
+
+# Windows: 启动服务
+sc start nvgpu
+# 或
+nvgpu -config C:\nvgpu\config.yaml service start
+```
 
 **GPU 诊断**：
 
@@ -240,8 +262,9 @@ ssh:
 按**物理块设备**采集磁盘原始容量，不关心挂载目录。
 
 - 报告物理磁盘的原始容量（`/sys/block/<dev>/size` × 512）、型号、`rotational` 标记
-- `disks` 白名单写设备名，如 `["nvme0n1", "sda"]`，支持带 `/dev/` 前缀（Windows 写磁盘序号 `["0", "1"]`）
-- 自动发现时排除虚拟设备（loop / dm / md / zram 等）和光驱，忽略 <10 GiB 的小盘
+- `disks` 白名单写设备名，如 `["nvme0n1", "sda"]`，支持带 `/dev/` 前缀
+- **Windows**：走原生 `DeviceIoControl` + IOCTL 枚举 `\\.\PHYSICALDRIVE0..63`，白名单写 `["0", "1"]` 或 `["PhysicalDrive0"]`（大小写不敏感）
+- 自动发现时排除虚拟设备（loop / dm / md / zram 等）和光驱（Windows 跳过 RemovableMedia），忽略 <10 GiB 的小盘
 - 远程节点优先用 `lsblk`，缺了就退回纯 `/sys/block` 的 shell 循环，**不需要 root，也不需要额外二进制**
 - **限制：`used_bytes` 与 `usage_percent` 恒为 0。** 块设备层面没有"已用"概念，要算用量得聚合它所有分区的挂载点，当前版本不做
 - 适用场景：回答"这台机器有几块物理盘、每块多大、什么型号"
@@ -277,6 +300,30 @@ nodes:
    ```
 3. 重启服务：`nvgpu.exe service restart`
 
+**GPU 数据周期性消失 / 日志里报 `context deadline exceeded`**：Windows 上 `nvidia-smi` 冷启动（驱动加载 + 显卡从低功耗态唤醒）常要 1-4 秒。GPU 采集因此跑在独立 goroutine 里（单飞 + 缓存），用自己的 `gpu_timeout`（默认 10s），采集轮次直接读缓存值 —— 所以 `interval: 2s` 也不会再拖垮 GPU 采集。仍然超时的话在节点上放宽：
+
+```yaml
+nodes:
+  - name: local
+    type: local
+    gpu_timeout: 20s
+```
+
+缓存值的实际采样时刻会通过 `gpus_sampled_at` 字段暴露（仅当它明显早于 `timestamp` 时出现）。超过 `max(3×interval, 30s)` 未更新的数据会被丢弃，不会把陈旧利用率当成当前值展示。
+
+**Windows 上磁盘采不到 / 采得太多**：
+- `mount` 模式只枚举 `DRIVE_FIXED`（本地固定磁盘）。U 盘、光驱、网络盘默认跳过 —— 掉线的网络盘和空读卡器会阻塞数秒，把整轮采集拖成离线。需要采就在 `disks` 里显式列出盘符。
+- 盘符写法不敏感：`"C:"`、`"c:\"`、`"C:/"` 都能命中，上报统一为 `C:\`。
+- `block` 模式走原生 IOCTL（不再依赖已被 Win11 24H2 / Server 2025 移除的 `wmic`），白名单写 `["0", "1"]`。
+- 用 `-v` 跑一遍能看到每个盘符/磁盘的逐条判定结果（类型、是否跳过、原因）。
+
+**排查任何采集问题的第一步**：前台带 `-v` 跑一遍。
+
+```bash
+nvgpu -v -config config.yaml
+```
+
+输出包含 nvidia-smi 候选逐条扫描结果、每轮各子系统耗时、磁盘判定原因、HTTP 请求行。
 
 ## HTTP API
 

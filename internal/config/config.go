@@ -131,6 +131,10 @@ type Node struct {
 	// PartitionCacheTTL 挂载点缓存 TTL（仅 type=local 且 disk_mode=mount 时有效）。
 	// 留空使用默认 60s，显式设为 0 禁用缓存。挂载点变化频率极低，缓存可节省 5-20ms。
 	PartitionCacheTTL *Duration `yaml:"partition_cache_ttl"`
+	// GPUTimeout GPU 单次采集超时，独立于 collect_timeout 与 interval。
+	// 留空使用默认 10s。Windows 上 nvidia-smi 冷启动（驱动加载 + 卡唤醒）常需 1-4s，
+	// 若沿用 min(collect_timeout, interval) 的预算会稳定超时导致 GPU 数据缺失。
+	GPUTimeout *Duration `yaml:"gpu_timeout"`
 	// SSH 仅在 type=ssh 时有效。
 	SSH *SSH `yaml:"ssh"`
 }

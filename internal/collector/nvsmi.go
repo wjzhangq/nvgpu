@@ -14,6 +14,21 @@ func isFile(p string) bool {
 	return err == nil && !st.IsDir()
 }
 
+// pathCandidate 是一个被检查过的 nvidia-smi 候选位置。
+// Miss 非空表示这个位置没命中，内容是原因（诊断报告会原样展示）。
+type pathCandidate struct {
+	Path   string
+	Source string // "PATH" / "固定位置" / "DriverStore"
+	Miss   string
+}
+
+// nvidiaSmiVersionArgs 查询驱动与 nvidia-smi 自身的版本。
+// 单独一条命令，因为它在 --query-gpu 失败时通常还能成功 —— 能区分
+// "nvidia-smi 跑不起来" 和 "跑起来了但查不到卡"。
+func nvidiaSmiVersionArgs() []string {
+	return []string{"--query-gpu=driver_version,name,pci.bus_id", "--format=csv,noheader"}
+}
+
 // nvsmiResult 是一次 nvidia-smi 调用的结果。
 type nvsmiResult struct {
 	stdout string

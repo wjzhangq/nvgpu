@@ -42,7 +42,12 @@ func main() {
 
 	// gpu-probe：打印 GPU 采集诊断报告后退出。
 	if len(flag.Args()) > 0 && flag.Args()[0] == "gpu-probe" {
-		runGPUProbe(*cfgPath)
+		// 可选参数：覆盖配置的 nvidia-smi 路径
+		var overridePath string
+		if len(flag.Args()) > 1 {
+			overridePath = flag.Args()[1]
+		}
+		runGPUProbe(*cfgPath, overridePath)
 		return
 	}
 
@@ -193,9 +198,14 @@ func runNode(ctx context.Context, c collector.Collector, interval, timeout time.
 //
 // 配置文件读不到也要继续 —— 用户遇到"看板上没有 GPU"时，往往正是配置还没
 // 摆好的阶段，这时候诊断信息比配置校验更有用。
-func runGPUProbe(cfgPath string) {
+func runGPUProbe(cfgPath, overridePath string) {
 	var configured string
-	if cfg, err := config.Load(cfgPath); err == nil {
+
+	// 命令行参数优先级最高
+	if overridePath != "" {
+		configured = overridePath
+		fmt.Printf("使用命令行指定路径: %s\n\n", overridePath)
+	} else if cfg, err := config.Load(cfgPath); err == nil {
 		for _, n := range cfg.Nodes {
 			if n.Type == config.TypeLocal {
 				configured = n.NvidiaSmi

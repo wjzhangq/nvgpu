@@ -123,9 +123,16 @@ cp config.example.yaml config.yaml
 
 ```bash
 nvgpu gpu-probe
+# 或指定路径测试
+nvgpu gpu-probe /path/to/nvidia-smi
 ```
 
-打印 GPU 采集诊断报告：nvidia-smi 探测结果、实际执行的命令、退出状态、原始输出、解析结果。
+打印 GPU 采集诊断报告，包含：
+- 平台信息与 NVML 编译状态
+- nvidia-smi 完整探测过程（按顺序检查了哪些位置、分别为什么没命中、最终用哪个）
+- 驱动版本查询（能区分"驱动没装"和"装了但查不到卡"）
+- 实际采集命令的退出状态、stderr、stdout 原始输出
+- 解析结果（多少张 GPU、各字段值）
 
 **适用场景**：
 - Windows 服务里 GPU 数据是空的，不知道为什么
@@ -260,6 +267,7 @@ nodes:
 
 **Windows 服务里 GPU 数据是空的**：
 1. 用管理员权限运行 `nvgpu.exe gpu-probe`，查看诊断报告
+   - 如需测试指定路径，可传递第二个参数：`nvgpu.exe gpu-probe "C:\path\to\nvidia-smi.exe"`
 2. 如果报告显示"未找到"，手动在 PowerShell 里执行 `where.exe nvidia-smi.exe`，把完整路径填进配置：
    ```yaml
    nodes:

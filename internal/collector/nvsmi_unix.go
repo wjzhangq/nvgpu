@@ -3,7 +3,6 @@
 package collector
 
 import (
-	"os"
 	"os/exec"
 )
 
@@ -19,7 +18,7 @@ func defaultNvidiaSmiPath() string {
 		"/usr/local/nvidia/bin/nvidia-smi",
 		"/opt/nvidia/bin/nvidia-smi",
 	} {
-		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+		if isFile(p) {
 			return p
 		}
 	}

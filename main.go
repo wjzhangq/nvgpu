@@ -40,6 +40,12 @@ func main() {
 		return
 	}
 
+	// gpu-probe：打印 GPU 采集诊断报告后退出。
+	if len(flag.Args()) > 0 && flag.Args()[0] == "gpu-probe" {
+		runGPUProbe(*cfgPath)
+		return
+	}
+
 	if *showVersion {
 		fmt.Println("gpumon", version)
 		return
@@ -181,4 +187,26 @@ func runNode(ctx context.Context, c collector.Collector, interval, timeout time.
 			collectOnce()
 		}
 	}
+}
+
+// runGPUProbe 执行 GPU 采集诊断并把报告打到 stdout。
+//
+// 配置文件读不到也要继续 —— 用户遇到"看板上没有 GPU"时，往往正是配置还没
+// 摆好的阶段，这时候诊断信息比配置校验更有用。
+func runGPUProbe(cfgPath string) {
+	var configured string
+	if cfg, err := config.Load(cfgPath); err == nil {
+		for _, n := range cfg.Nodes {
+			if n.Type == config.TypeLocal {
+				configured = n.NvidiaSmi
+				break
+			}
+		}
+	} else {
+		fmt.Printf("（配置 %s 未能加载: %v，按自动探测继续）\n\n", cfgPath, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	collector.ProbeGPU(ctx, os.Stdout, configured)
 }

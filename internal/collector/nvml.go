@@ -9,6 +9,9 @@ import (
 	"github.com/wjzhangq/gpumon/internal/model"
 )
 
+// nvmlBuildStatus 供诊断输出使用，说明本二进制是否编入了 NVML。
+func nvmlBuildStatus() string { return "已编入（优先使用，失败回退 nvidia-smi）" }
+
 // collectGPUsNVML 使用 NVML 库直接查询 GPU（本地）。
 // 相比 nvidia-smi，NVML 避免了进程启动开销，速度快 4-5 倍（5-15ms vs 50-200ms）。
 func (l *Local) collectGPUsNVML(ctx context.Context) []model.GPU {

@@ -2,6 +2,7 @@ package collector
 
 import (
 	"context"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,6 +34,9 @@ type Local struct {
 
 	host model.HostInfo
 	topo []socketInfo
+
+	// gpuWarned 是上一次打印过的 GPU 告警文本，用于日志去重。
+	gpuWarned string
 
 	// 磁盘分区缓存（仅 mount 模式）：挂载点变化频率极低，缓存可减少 5-20ms 开销
 	partitionsCache     []disk.PartitionStat
@@ -206,21 +210,57 @@ func (l *Local) collectDisks(ctx context.Context) []model.Disk {
 	return out
 }
 
+// collectGPUs 采集本机 GPU：优先 NVML，失败回退 nvidia-smi。
+//
+// Windows 发行包是 no_nvml 构建（交叉编译无法带 CGO），所以那边实际上
+// 100% 走 nvidia-smi 这条路，任何一环失败都会让整块 GPU 数据消失 ——
+// 因此这里的每种失败都要留下可诊断的日志，而不是静默返回 nil。
 func (l *Local) collectGPUs(ctx context.Context) []model.GPU {
 	// 优先尝试 NVML（快 4-5 倍：5-15ms vs 50-200ms）
 	if gpus := l.collectGPUsNVML(ctx); len(gpus) > 0 {
 		return gpus
 	}
-	// fallback: nvidia-smi
+
+	// 启动时没探到路径（常见于 Windows 服务：服务进程的 PATH 不含驱动目录，
+	// 或安装时驱动还没就绪），每轮重试一次探测 —— 探测本身只是几个 Stat。
 	if l.nvsmi == "" {
+		l.nvsmi = defaultNvidiaSmiPath()
+		if l.nvsmi == "" {
+			l.warnGPUOnce("找不到 nvidia-smi，GPU 数据不可用（可在配置里显式设置 nvidia_smi 路径）")
+			return nil
+		}
+		log.Printf("node %q: 已定位 nvidia-smi: %s", l.name, l.nvsmi)
+	}
+
+	res := runNvidiaSmi(ctx, l.nvsmi, nvidiaArgs())
+	gpus := parseNvidiaCSV(res.stdout)
+	if len(gpus) > 0 {
+		l.gpuWarned = "" // 恢复正常，允许下次故障重新告警
+		return gpus
+	}
+
+	if res.err != nil {
+		// 路径可能因驱动升级而失效（DriverStore 目录名带版本号），
+		// 清空以便下一轮重新探测。
+		if !isFile(l.nvsmi) {
+			log.Printf("node %q: nvidia-smi 路径已失效（%s），下轮重新探测", l.name, l.nvsmi)
+			l.nvsmi = ""
+		}
+		l.warnGPUOnce("nvidia-smi 执行失败: " + res.briefError())
 		return nil
 	}
-	cmd := exec.CommandContext(ctx, l.nvsmi, nvidiaArgs()...)
-	out, err := cmd.Output()
-	if err != nil {
-		return nil
+	l.warnGPUOnce("nvidia-smi 未返回可解析的 GPU 数据: " + res.briefError())
+	return nil
+}
+
+// warnGPUOnce 打印 GPU 采集告警，相同内容只打一次。
+// 采集是秒级循环，若不去重，一台没有 N 卡的机器会把日志刷爆。
+func (l *Local) warnGPUOnce(msg string) {
+	if l.gpuWarned == msg {
+		return
 	}
-	return parseNvidiaCSV(string(out))
+	l.gpuWarned = msg
+	log.Printf("node %q: %s", l.name, msg)
 }
 
 func (l *Local) collectBlockDevices(ctx context.Context) []model.Disk {

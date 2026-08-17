@@ -119,6 +119,21 @@ cp config.example.yaml config.yaml
 | `-listen` | 覆盖配置里的 `server.listen` |
 | `-version` | 打印版本号后退出 |
 
+**GPU 诊断**：
+
+```bash
+nvgpu gpu-probe
+```
+
+打印 GPU 采集诊断报告：nvidia-smi 探测结果、实际执行的命令、退出状态、原始输出、解析结果。
+
+**适用场景**：
+- Windows 服务里 GPU 数据是空的，不知道为什么
+- 检查 nvidia-smi 是否被正确探测（自动探测结果或配置的路径）
+- 验证输出格式能否被解析
+
+诊断报告可直接复制发给项目维护者，便于远程定位。
+
 **服务管理**：
 
 ```bash
@@ -241,7 +256,19 @@ nodes:
 
 ### 常见坑
 
-非交互式 SSH 会话拿到的 `PATH` 通常很窄，`nvidia-smi` 经常不在里面。脚本已经自动补了几个常见目录，仍然找不到的话在节点上写死 `nvidia_smi: /usr/bin/nvidia-smi`。
+**远程 SSH 采集找不到 nvidia-smi**：非交互式 SSH 会话拿到的 `PATH` 通常很窄，`nvidia-smi` 经常不在里面。脚本已经自动补了几个常见目录，仍然找不到的话在节点上写死 `nvidia_smi: /usr/bin/nvidia-smi`。
+
+**Windows 服务里 GPU 数据是空的**：
+1. 用管理员权限运行 `nvgpu.exe gpu-probe`，查看诊断报告
+2. 如果报告显示"未找到"，手动在 PowerShell 里执行 `where.exe nvidia-smi.exe`，把完整路径填进配置：
+   ```yaml
+   nodes:
+     - name: local
+       type: local
+       nvidia_smi: "C:\\Windows\\System32\\DriverStore\\FileRepository\\nvdm...\\nvidia-smi.exe"
+   ```
+3. 重启服务：`nvgpu.exe service restart`
+
 
 ## HTTP API
 

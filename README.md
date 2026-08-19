@@ -36,6 +36,8 @@
 
 **内置 Web 看板。** 访问 `http://<listen>/` 可查看实时监控看板，每 5 秒自动刷新。单文件 HTML（约 6KB），编译到二进制，无需额外部署。
 
+**Agent 状态上报。** 外部 agent 程序可通过 `POST /api/v1/agents` 上报自身状态（`start` / `end`），通过 `GET /api/v1/agents` 查询。状态存内存，agent 名唯一，超过 1 小时未更新自动清理。`/api/v1/metrics` 也会带上 `agents` 字段。
+
 ## 支持范围
 
 - 中心进程：Linux (amd64 / arm64) 和 Windows (amd64)
@@ -327,7 +329,7 @@ nvgpu -v -config config.yaml
 
 ## HTTP API
 
-所有接口只读，只接受 `GET`。**没有鉴权**，请只绑内网地址或放在反向代理后面。
+所有接口只接受 `GET`（除 `/api/v1/agents` 支持 `POST`）。**没有鉴权**，请只绑内网地址或放在反向代理后面。
 
 ### `GET /`
 
@@ -338,6 +340,8 @@ nvgpu -v -config config.yaml
 ### `GET /api/v1/metrics`
 
 当前指标。`?node=a,b` 过滤（可重复传参），留空返回全部。
+
+**v1.2+ 新增**：返回结果中增加 `agents` 字段，包含所有活跃的 agent 状态（详见 `POST /api/v1/agents`）。
 
 ```json
 {
@@ -396,6 +400,18 @@ nvgpu -v -config config.yaml
           "usage_percent": 30.0
         }
       ]
+    }
+  ],
+  "agents": [
+    {
+      "agent": "video",
+      "status": "start",
+      "updated_at": "2026-08-16T09:58:32+08:00"
+    },
+    {
+      "agent": "audio",
+      "status": "end",
+      "updated_at": "2026-08-16T09:59:15+08:00"
     }
   ]
 }
@@ -474,6 +490,67 @@ nvgpu -v -config config.yaml
 ### `GET /healthz`
 
 存活探针。
+
+### `POST /api/v1/agents`
+
+**v1.2+ 新增**：提交 agent 状态。用于外部 agent 程序向监控中心报告自身状态。
+
+**请求体**：
+
+```json
+{
+  "agent": "video",
+  "status": "start"  // 或 "end"
+}
+```
+
+**响应**：
+
+```json
+{
+  "agent": "video",
+  "status": "start",
+  "updated_at": "2026-08-16T10:00:00+08:00"
+}
+```
+
+**状态说明**：
+- `start` - agent 启动或运行中
+- `end` - agent 已停止
+
+**存储特性**：
+- agent 名称唯一，重复提交会更新状态和时间戳
+- 状态存储在内存中，服务重启后清空
+- 超过 1 小时未更新的 agent 会被自动清理
+
+**错误响应**：
+- `400 Bad Request` - agent 名称为空、status 非法或 JSON 格式错误
+
+### `GET /api/v1/agents`
+
+**v1.2+ 新增**：获取所有 agent 状态。
+
+**响应**：
+
+```json
+{
+  "generated_at": "2026-08-16T10:00:00+08:00",
+  "agents": [
+    {
+      "agent": "audio",
+      "status": "start",
+      "updated_at": "2026-08-16T09:58:15+08:00"
+    },
+    {
+      "agent": "video",
+      "status": "end",
+      "updated_at": "2026-08-16T09:59:42+08:00"
+    }
+  ]
+}
+```
+
+agents 数组按 agent 名称字母序排列。无活跃 agent 时返回空数组 `[]`。
 
 ## GPU 温度与功耗字段
 

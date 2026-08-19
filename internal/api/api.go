@@ -5,8 +5,10 @@ import (
 	_ "embed"
 	"encoding/json"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/wjzhangq/gpumon/internal/config"
@@ -42,12 +44,27 @@ type HistoryEntry struct {
 	Samples []model.Snapshot `json:"samples"`
 }
 
+// AgentStatus 表示一个 agent 的上报状态。
+type AgentStatus struct {
+	Agent     string    `json:"agent"`
+	Status    string    `json:"status"`     // "start" 或 "end"
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// agentStore 是 agent 状态的内存存储。
+type agentStore struct {
+	mu     sync.RWMutex
+	agents map[string]*AgentStatus // key: agent 名称
+}
+
 // Server 持有 API 依赖。
 type Server struct {
-	store *store.Store
-	metas map[string]NodeMeta
-	order []string
-	cors  bool
+	store       *store.Store
+	metas       map[string]NodeMeta
+	order       []string
+	cors        bool
+	agentStore  *agentStore
+	cleanupDone chan struct{}
 }
 
 // New 构造 API 服务。
@@ -57,6 +74,10 @@ func New(cfg *config.Config, st *store.Store) *Server {
 		metas: make(map[string]NodeMeta, len(cfg.Nodes)),
 		order: cfg.NodeNames(),
 		cors:  cfg.Server.CORSEnabled(),
+		agentStore: &agentStore{
+			agents: make(map[string]*AgentStatus),
+		},
+		cleanupDone: make(chan struct{}),
 	}
 	for _, n := range cfg.Nodes {
 		m := NodeMeta{
@@ -69,7 +90,64 @@ func New(cfg *config.Config, st *store.Store) *Server {
 		}
 		s.metas[n.Name] = m
 	}
+
+	go s.runAgentCleanup()
+
 	return s
+}
+
+// agentTTL 是 agent 状态的存活时长，超过这个时间没更新就被清理。
+const agentTTL = time.Hour
+
+// runAgentCleanup 周期性清理过期的 agent 状态。
+func (s *Server) runAgentCleanup() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.sweepAgents(time.Now())
+		case <-s.cleanupDone:
+			return
+		}
+	}
+}
+
+// sweepAgents 删除在 now 时刻已超过 TTL 的 agent，返回删除数量。
+func (s *Server) sweepAgents(now time.Time) int {
+	s.agentStore.mu.Lock()
+	defer s.agentStore.mu.Unlock()
+
+	removed := 0
+	for name, agent := range s.agentStore.agents {
+		if now.Sub(agent.UpdatedAt) > agentTTL {
+			delete(s.agentStore.agents, name)
+			removed++
+			logx.Debugf("agent %q 已清理（超过 %s 未更新）", name, agentTTL)
+		}
+	}
+	return removed
+}
+
+// Shutdown 停止后台清理 goroutine。
+func (s *Server) Shutdown() {
+	close(s.cleanupDone)
+}
+
+// snapshotAgents 返回当前所有 agent 状态，按名称排序。
+func (s *Server) snapshotAgents() []AgentStatus {
+	s.agentStore.mu.RLock()
+	agents := make([]AgentStatus, 0, len(s.agentStore.agents))
+	for _, a := range s.agentStore.agents {
+		agents = append(agents, *a)
+	}
+	s.agentStore.mu.RUnlock()
+
+	sort.Slice(agents, func(i, j int) bool {
+		return agents[i].Agent < agents[j].Agent
+	})
+	return agents
 }
 
 // Handler 返回配置好的路由。
@@ -79,6 +157,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/v1/nodes", s.handleNodes)
 	mux.HandleFunc("/api/v1/metrics", s.handleMetrics)
 	mux.HandleFunc("/api/v1/history", s.handleHistory)
+	mux.HandleFunc("/api/v1/agents", s.handleAgentsDispatch)
 	mux.HandleFunc("/", s.handleDashboard)
 	return s.withMiddleware(mux)
 }
@@ -92,14 +171,22 @@ func (s *Server) withMiddleware(next http.Handler) http.Handler {
 			}
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		}
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		// 除 /api/v1/agents 之外的接口一律只读。
+		switch r.Method {
+		case http.MethodGet, http.MethodHead:
+		case http.MethodPost:
+			if r.URL.Path != "/api/v1/agents" {
+				writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "只支持 GET"})
+				return
+			}
+		default:
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "只支持 GET"})
 			return
 		}
@@ -176,6 +263,50 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"generated_at": time.Now(),
 		"nodes":        out,
+		"agents":       s.snapshotAgents(),
+	})
+}
+
+// handleAgentsDispatch 按方法分发：POST 上报状态，GET 查询状态。
+func (s *Server) handleAgentsDispatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		s.handleAgentsPost(w, r)
+		return
+	}
+	s.handleAgentsGet(w, r)
+}
+
+func (s *Server) handleAgentsPost(w http.ResponseWriter, r *http.Request) {
+	var req AgentStatus
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体不是合法 JSON"})
+		return
+	}
+
+	req.Agent = strings.TrimSpace(req.Agent)
+	if req.Agent == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "agent 字段必填"})
+		return
+	}
+	if req.Status != "start" && req.Status != "end" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "status 必须为 start 或 end"})
+		return
+	}
+
+	req.UpdatedAt = time.Now()
+
+	s.agentStore.mu.Lock()
+	s.agentStore.agents[req.Agent] = &req
+	s.agentStore.mu.Unlock()
+
+	logx.Debugf("agent %q 上报状态 %s", req.Agent, req.Status)
+	writeJSON(w, http.StatusOK, req)
+}
+
+func (s *Server) handleAgentsGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"generated_at": time.Now(),
+		"agents":       s.snapshotAgents(),
 	})
 }
 

@@ -134,9 +134,10 @@ func run(ctx context.Context, cfgPath, listenOverride string) error {
 		log.Printf("node %q: type=%s interval=%s timeout=%s", n.Name, n.Type, n.Interval.Duration, timeout)
 	}
 
+	apiServer := api.New(cfg, st)
 	srv := &http.Server{
 		Addr:              cfg.Server.Listen,
-		Handler:           api.New(cfg, st).Handler(),
+		Handler:           apiServer.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,
@@ -154,11 +155,14 @@ func run(ctx context.Context, cfgPath, listenOverride string) error {
 	select {
 	case err := <-errCh:
 		stop()
+		apiServer.Shutdown()
 		wg.Wait()
 		return fmt.Errorf("HTTP 服务异常退出: %w", err)
 	case <-ctx.Done():
 		log.Printf("收到退出信号，正在关闭…")
 	}
+
+	apiServer.Shutdown()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
